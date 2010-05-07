@@ -5,6 +5,8 @@
 
 // JSONP mimetype
 ngx_str_t ngx_http_jsonp_mimetype = ngx_string("text/javascript");
+// Variable name
+ngx_str_t ngx_http_jsonp_callback_variable_name = ngx_string("jsonp_callback");
 
 
 // Configuration structure
@@ -12,6 +14,7 @@ ngx_str_t ngx_http_jsonp_mimetype = ngx_string("text/javascript");
 // options
 typedef struct {
     ngx_flag_t enable;
+    ngx_int_t  variable_index;
 } ngx_http_jsonp_conf_t;
 
 // Runtime context structure
@@ -19,7 +22,18 @@ typedef struct {
 // over a request
 typedef struct {
     unsigned prefix:1;
+    ngx_str_t callback;
 } ngx_http_jsonp_ctx_t;
+
+
+
+static char * ngx_http_jsonp_directive_jsonp(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static void * ngx_http_jsonp_create_conf(ngx_conf_t *cf);
+static char * ngx_http_jsonp_merge_conf(ngx_conf_t *cf, void *parent, void *child);
+static ngx_int_t ngx_http_jsonp_body_filter( ngx_http_request_t *r, ngx_chain_t *in );
+static ngx_int_t ngx_http_jsonp_header_filter( ngx_http_request_t *r );
+static ngx_int_t ngx_http_jsonp_filter_init( ngx_conf_t * cf );
+
 
 
 // Configuration directives for this module
@@ -27,18 +41,12 @@ static ngx_command_t  ngx_http_jsonp_filter_commands[] = {
     { ngx_string("jsonp"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF
                         |NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
+      ngx_http_jsonp_directive_jsonp,
+      //ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_jsonp_conf_t, enable),
       NULL }
 };
-
-
-static void * ngx_http_jsonp_create_conf(ngx_conf_t *cf);
-static char * ngx_http_jsonp_merge_conf(ngx_conf_t *cf, void *parent, void *child);
-static ngx_int_t ngx_http_jsonp_body_filter( ngx_http_request_t *r, ngx_chain_t *in );
-static ngx_int_t ngx_http_jsonp_header_filter( ngx_http_request_t *r );
-static ngx_int_t ngx_http_jsonp_filter_init( ngx_conf_t * cf );
 
 
 static ngx_http_module_t  ngx_http_jsonp_filter_module_ctx = {
@@ -75,6 +83,25 @@ static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
 
+
+// Parse the jsonp directive
+static char * ngx_http_jsonp_directive_jsonp(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    // Actually, we just get the index of the variable for the config object
+    // then let the built-in flag processing function do the rest
+    ngx_http_jsonp_conf_t * jsonp_cf = conf;
+    jsonp_cf->variable_index = ngx_http_get_variable_index(cf, &ngx_http_jsonp_callback_variable_name);
+
+    if (jsonp_cf->variable_index == NGX_ERROR)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    return ngx_conf_set_flag_slot(cf, cmd, conf);
+}
+    
+    
+
 // Initialize a configuration structure
 static void * ngx_http_jsonp_create_conf(ngx_conf_t *cf)
 {
@@ -82,6 +109,7 @@ static void * ngx_http_jsonp_create_conf(ngx_conf_t *cf)
     json_conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_jsonp_conf_t));
 
     json_conf->enable = NGX_CONF_UNSET;
+    json_conf->variable_index = NGX_CONF_UNSET;
 
     return json_conf;
 }
@@ -96,6 +124,13 @@ static char * ngx_http_jsonp_merge_conf(ngx_conf_t *cf, void *parent, void *chil
     // note the 0 default value
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
 
+    // Inherit the variable index from the parent
+    // if not defined
+    if (conf->variable_index == NGX_CONF_UNSET)
+    {
+        conf->variable_index = prev->variable_index;
+    }
+
     return NGX_CONF_OK;
 }
 
@@ -105,6 +140,7 @@ static ngx_int_t ngx_http_jsonp_header_filter( ngx_http_request_t *r )
 {
     ngx_http_jsonp_conf_t * cf;
     ngx_http_jsonp_ctx_t * ctx;
+    ngx_http_variable_value_t * callback;
 
     // Getting the current configuration object
     cf = ngx_http_get_module_loc_conf(r, ngx_http_jsonp_filter_module);
@@ -114,26 +150,45 @@ static ngx_int_t ngx_http_jsonp_header_filter( ngx_http_request_t *r )
     {
 
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "http jsonp wrap filter");
+                       "http jsonp filter");
 
-        // Allocating a new request context for the body filter
-        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_jsonp_ctx_t));
-        if (ctx == NULL)
-        {
-            return NGX_ERROR;
+        // Get the callback name from variable
+        // and store it in the context
+        callback = ngx_http_get_indexed_variable(r, cf->variable_index);
+
+        if (callback == NULL || callback->not_found || callback->len == 0) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "http jsonp filter: the \"%V\" variable is not set",
+                &ngx_http_jsonp_callback_variable_name);
+            // We will not return an error on this case
+            // return NGX_ERROR
         }
-        ngx_http_set_ctx(r, ctx, ngx_http_jsonp_filter_module);
-
-        // JSONP is has a text/javascript mimetype, let's change the Content-Type
-        // header for the response
-        r->headers_out.content_type = ngx_http_jsonp_mimetype;
-        r->headers_out.content_type_len = ngx_http_jsonp_mimetype.len;
-        
-        // Modifying the content lenght if it is set,
-        // adding the length of the json padding
-        if (r->headers_out.content_length_n != -1)
+        else
         {
-            r->headers_out.content_length_n += sizeof("callback();") - 1;
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http jsonp filter: json callback is \"%v\"", callback);
+
+            // Allocating a new request context for the body filter
+            ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_jsonp_ctx_t));
+            if (ctx == NULL)
+            {
+                return NGX_ERROR;
+            }
+            // Store the variable in the context
+            ctx->callback.len = callback->len;
+            ctx->callback.data = callback->data;
+            ngx_http_set_ctx(r, ctx, ngx_http_jsonp_filter_module);
+
+            // JSONP is has a text/javascript mimetype, let's change the Content-Type
+            // header for the response
+            r->headers_out.content_type = ngx_http_jsonp_mimetype;
+            r->headers_out.content_type_len = ngx_http_jsonp_mimetype.len;
+            
+            // Modifying the content lenght if it is set,
+            // adding the length of the json padding
+            if (r->headers_out.content_length_n != -1)
+            {
+                r->headers_out.content_length_n += callback->len + 3;
+            }
         }
     }
 
@@ -162,7 +217,7 @@ static ngx_int_t ngx_http_jsonp_body_filter( ngx_http_request_t *r, ngx_chain_t 
         // Insert the function name
         // Allocate a new buffer for that, and a new link
         // in the response buffer chain
-        buf = ngx_calloc_buf(r->pool);
+        buf = ngx_create_temp_buf(r->pool, ctx->callback.len + 1);
         chain = ngx_alloc_chain_link(r->pool);
 
         if (buf == NULL || chain == NULL) {
@@ -170,12 +225,9 @@ static ngx_int_t ngx_http_jsonp_body_filter( ngx_http_request_t *r, ngx_chain_t 
         }
 
         // Initialize the buffer with the right content and length
-        buf->pos = (u_char *) "callback(";
-        buf->last = buf->pos + sizeof("callback(") - 1;
-
-        // This is an in-memory buffer
-        // if not specified, nginx will think this buffer is empty
-        buf->memory = 1;
+        ngx_memcpy(buf->pos, ctx->callback.data, ctx->callback.len);
+        buf->pos[ctx->callback.len] = '(';
+        buf->last = buf->pos + ctx->callback.len + 1;
 
         // Let's replace insert that new buffer+link in front of the
         // buffer chain
