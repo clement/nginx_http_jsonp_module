@@ -7,14 +7,22 @@
 ngx_str_t ngx_http_jsonp_mimetype = ngx_string("text/javascript");
 // Variable name
 ngx_str_t ngx_http_jsonp_callback_variable_name = ngx_string("jsonp_callback");
+// Default applicable mimetypes
+ngx_str_t ngx_http_jsonp_default_mimetypes[] = {
+    ngx_string("application/json"),
+    ngx_null_string
+};
 
 
 // Configuration structure
 // will hold runtime configuration
 // options
 typedef struct {
-    ngx_flag_t enable;
-    ngx_int_t  variable_index;
+    ngx_flag_t      enable;
+    ngx_int_t       variable_index;
+
+    ngx_hash_t      mimetypes;
+    ngx_array_t   * mimetypes_keys;
 } ngx_http_jsonp_conf_t;
 
 // Runtime context structure
@@ -45,6 +53,14 @@ static ngx_command_t  ngx_http_jsonp_filter_commands[] = {
       //ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_jsonp_conf_t, enable),
+      NULL },
+
+    { ngx_string("jsonp_types"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF
+                        |NGX_CONF_1MORE,
+      ngx_http_types_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_jsonp_conf_t, mimetypes_keys),
       NULL }
 };
 
@@ -131,6 +147,14 @@ static char * ngx_http_jsonp_merge_conf(ngx_conf_t *cf, void *parent, void *chil
         conf->variable_index = prev->variable_index;
     }
 
+    // Merge the applicable mimetypes
+    if (ngx_http_merge_types(cf, conf->mimetypes_keys, &conf->mimetypes,
+                             prev->mimetypes_keys, &prev->mimetypes,
+                             ngx_http_jsonp_default_mimetypes) != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
     return NGX_CONF_OK;
 }
 
@@ -148,46 +172,55 @@ static ngx_int_t ngx_http_jsonp_header_filter( ngx_http_request_t *r )
     if (cf->enable && r->headers_out.status == NGX_HTTP_OK
                    && !r->header_only )
     {
-
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "http jsonp filter");
 
-        // Get the callback name from variable
-        // and store it in the context
-        callback = ngx_http_get_indexed_variable(r, cf->variable_index);
-
-        if (callback == NULL || callback->not_found || callback->len == 0) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                "http jsonp filter: the \"%V\" variable is not set",
-                &ngx_http_jsonp_callback_variable_name);
-            // We will not return an error on this case
-            // return NGX_ERROR
+        // Do we have a content type matching the ones provided
+        // in the configuration?
+        if ( ngx_http_test_content_type(r, &cf->mimetypes) == NULL )
+        {
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                "http jsonp filter: enabled but not configured for this mimetype");
         }
         else
         {
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http jsonp filter: json callback is \"%v\"", callback);
+            // Get the callback name from variable
+            // and store it in the context
+            callback = ngx_http_get_indexed_variable(r, cf->variable_index);
 
-            // Allocating a new request context for the body filter
-            ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_jsonp_ctx_t));
-            if (ctx == NULL)
-            {
-                return NGX_ERROR;
+            if (callback == NULL || callback->not_found || callback->len == 0) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                    "http jsonp filter: the \"%V\" variable is not set",
+                    &ngx_http_jsonp_callback_variable_name);
+                // We will not return an error on this case
+                // return NGX_ERROR
             }
-            // Store the variable in the context
-            ctx->callback.len = callback->len;
-            ctx->callback.data = callback->data;
-            ngx_http_set_ctx(r, ctx, ngx_http_jsonp_filter_module);
-
-            // JSONP is has a text/javascript mimetype, let's change the Content-Type
-            // header for the response
-            r->headers_out.content_type = ngx_http_jsonp_mimetype;
-            r->headers_out.content_type_len = ngx_http_jsonp_mimetype.len;
-            
-            // Modifying the content lenght if it is set,
-            // adding the length of the json padding
-            if (r->headers_out.content_length_n != -1)
+            else
             {
-                r->headers_out.content_length_n += callback->len + 3;
+                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http jsonp filter: json callback is \"%v\"", callback);
+
+                // Allocating a new request context for the body filter
+                ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_jsonp_ctx_t));
+                if (ctx == NULL)
+                {
+                    return NGX_ERROR;
+                }
+                // Store the variable in the context
+                ctx->callback.len = callback->len;
+                ctx->callback.data = callback->data;
+                ngx_http_set_ctx(r, ctx, ngx_http_jsonp_filter_module);
+
+                // JSONP is has a text/javascript mimetype, let's change the Content-Type
+                // header for the response
+                r->headers_out.content_type = ngx_http_jsonp_mimetype;
+                r->headers_out.content_type_len = ngx_http_jsonp_mimetype.len;
+                
+                // Modifying the content lenght if it is set,
+                // adding the length of the json padding
+                if (r->headers_out.content_length_n != -1)
+                {
+                    r->headers_out.content_length_n += callback->len + 3;
+                }
             }
         }
     }
